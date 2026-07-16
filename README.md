@@ -2,6 +2,10 @@
 
 An end-to-end machine learning project that detects and mitigates demographic bias in a loan approval classifier. Built on synthetic data with a controlled bias pattern, the project demonstrates a full fairness workflow: audit, mitigation, and explainability, deployed as an interactive web application.
 
+## Live Demo
+
+**[https://loan-approval-fairness-audit.streamlit.app](https://loan-approval-fairness-audit.streamlit.app)**
+
 ## Overview
 
 Standard machine learning models trained on historical lending data often reproduce demographic bias present in that data - even when protected attributes such as gender and race are explicitly withheld from the training features. This is because non-protected features (income, credit score, education) correlate with protected ones and act as proxy variables.
@@ -12,10 +16,6 @@ This project:
 - Applies Fairlearn's `ExponentiatedGradient` reduction with a Demographic Parity constraint to mitigate the bias.
 - Uses SHAP to attribute predictions to input features and expose the proxy-variable mechanism.
 - Deploys the trained models and audit dashboard as a Streamlit application.
-
-## Live Demo
-
-*(Add your Streamlit Community Cloud URL here after deployment)*
 
 ## Results
 
@@ -79,6 +79,7 @@ Open http://localhost:8501 in a browser.
 loan-approval-fairness/
 ├── app.py                # Streamlit application (self-contained)
 ├── requirements.txt      # Python dependencies
+├── runtime.txt           # Python version pin (3.12)
 ├── notebooks/            # Analysis notebooks
 ├── .gitignore
 └── README.md
