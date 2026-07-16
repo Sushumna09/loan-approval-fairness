@@ -1,8 +1,13 @@
 """
 Loan Approval Fairness Demo
-Streamlit app: predict + audit bias + mitigate
 
-Deploy to Hugging Face Spaces (Streamlit SDK).
+A Streamlit application that:
+  1. Predicts loan approval for a user-supplied applicant profile
+  2. Compares a baseline Random Forest against a Fairlearn-mitigated model
+  3. Reports demographic parity and equal opportunity gaps by gender and race
+
+Data is generated synthetically at startup with an intentional demographic
+bias pattern, so fairness metrics have a known ground truth.
 """
 
 import streamlit as st
@@ -13,18 +18,32 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from fairlearn.reductions import ExponentiatedGradient, DemographicParity
 
-st.set_page_config(page_title="Loan Fairness Demo",
-                   page_icon="scales", layout="wide")
+st.set_page_config(
+    page_title="Loan Approval Fairness Audit",
+    page_icon="scales",
+    layout="wide",
+)
 
 
-# ============================================================
-# DATA GENERATION (same as notebook Cell 1)
-# ============================================================
-def generate_loan_data(n_samples=10000, seed=42):
+# ---------------------------------------------------------------------------
+# Synthetic data generation
+# ---------------------------------------------------------------------------
+def generate_loan_data(n_samples: int = 10_000, seed: int = 42) -> pd.DataFrame:
+    """
+    Generate synthetic loan applications.
+
+    Feature distributions approximate real-world credit application data.
+    The historical approval label reflects both true risk factors and an
+    intentional demographic bias (gender pay gap + race-based approval bias),
+    modelling the kind of biased legacy data a real lender might have.
+    """
     rng = np.random.default_rng(seed)
+
     gender = rng.choice(['Male', 'Female'], size=n_samples, p=[0.55, 0.45])
-    race = rng.choice(['White', 'Black', 'Hispanic', 'Asian'],
-                      size=n_samples, p=[0.60, 0.15, 0.15, 0.10])
+    race = rng.choice(
+        ['White', 'Black', 'Hispanic', 'Asian'],
+        size=n_samples, p=[0.60, 0.15, 0.15, 0.10],
+    )
     age = rng.integers(21, 66, size=n_samples)
 
     edu_probs = {
@@ -38,46 +57,48 @@ def generate_loan_data(n_samples=10000, seed=42):
 
     base_income = pd.Series(education).map({
         'HighSchool': 35000, 'Bachelors': 60000,
-        'Masters': 85000, 'PhD': 110000
+        'Masters':    85000, 'PhD':      110000,
     }).values
-    gender_mult = np.where(gender == 'Female', 0.85, 1.0)
+    gender_multiplier = np.where(gender == 'Female', 0.85, 1.0)
     annual_income = np.clip(
-        base_income * gender_mult * rng.normal(1.0, 0.25, size=n_samples),
-        15000, 500000
+        base_income * gender_multiplier * rng.normal(1.0, 0.25, size=n_samples),
+        15000, 500000,
     ).astype(int)
 
     employment_type = rng.choice(
         ['Salaried', 'SelfEmployed', 'Unemployed'],
-        size=n_samples, p=[0.75, 0.20, 0.05]
+        size=n_samples, p=[0.75, 0.20, 0.05],
     )
     credit_score = np.clip(
         500 + 0.002 * annual_income + rng.normal(0, 80, size=n_samples),
-        300, 850
+        300, 850,
     ).astype(int)
     num_existing_loans = rng.integers(0, 6, size=n_samples)
-    previous_defaults = rng.choice([0, 1, 2, 3], size=n_samples,
-                                   p=[0.70, 0.20, 0.08, 0.02])
+    previous_defaults = rng.choice(
+        [0, 1, 2, 3], size=n_samples, p=[0.70, 0.20, 0.08, 0.02],
+    )
     loan_amount = np.clip(
         annual_income * rng.uniform(0.1, 2.0, size=n_samples),
-        1000, 1_000_000
+        1000, 1_000_000,
     ).astype(int)
     loan_term_months = rng.choice([12, 24, 36, 48, 60], size=n_samples)
 
     monthly_income = annual_income / 12
     monthly_debt = num_existing_loans * 300 + loan_amount / loan_term_months
-    dti = np.clip(monthly_debt / monthly_income, 0, 2).round(3)
+    debt_to_income = np.clip(monthly_debt / monthly_income, 0, 2).round(3)
 
-    home_ownership = rng.choice(['Own', 'Rent', 'Mortgage'],
-                                size=n_samples, p=[0.25, 0.45, 0.30])
+    home_ownership = rng.choice(
+        ['Own', 'Rent', 'Mortgage'], size=n_samples, p=[0.25, 0.45, 0.30],
+    )
 
     true_default_prob = np.clip(
         0.35
         - 0.0006 * (credit_score - 500)
-        + 0.30 * dti
+        + 0.30 * debt_to_income
         + 0.12 * previous_defaults
         - 0.000001 * annual_income
         + (employment_type == 'Unemployed') * 0.25,
-        0.02, 0.95
+        0.02, 0.95,
     )
     approval_score = (
         (1.0 - true_default_prob)
@@ -95,49 +116,54 @@ def generate_loan_data(n_samples=10000, seed=42):
         'num_existing_loans': num_existing_loans,
         'previous_defaults': previous_defaults,
         'loan_amount': loan_amount, 'loan_term_months': loan_term_months,
-        'debt_to_income_ratio': dti, 'home_ownership': home_ownership,
+        'debt_to_income_ratio': debt_to_income,
+        'home_ownership': home_ownership,
         'loan_approved': loan_approved,
     })
 
 
-# ============================================================
-# TRAIN MODELS (cached across sessions)
-# ============================================================
+# ---------------------------------------------------------------------------
+# Model training (cached; runs once per Streamlit session)
+# ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
-def train_models():
-    df = generate_loan_data(n_samples=10000, seed=42)
-    CAT = ['education', 'employment_type', 'home_ownership']
-    NUM = ['age', 'annual_income', 'credit_score', 'num_existing_loans',
-           'previous_defaults', 'loan_amount', 'loan_term_months',
-           'debt_to_income_ratio']
+def train_models() -> dict:
+    """Fit a baseline classifier and a fairness-constrained classifier."""
+    df = generate_loan_data(n_samples=10_000, seed=42)
 
-    X = pd.get_dummies(df[CAT + NUM], columns=CAT, drop_first=True)
+    categorical = ['education', 'employment_type', 'home_ownership']
+    numerical = [
+        'age', 'annual_income', 'credit_score', 'num_existing_loans',
+        'previous_defaults', 'loan_amount', 'loan_term_months',
+        'debt_to_income_ratio',
+    ]
+
+    X = pd.get_dummies(df[categorical + numerical], columns=categorical, drop_first=True)
     y = df['loan_approved']
     protected = df[['gender', 'race']]
 
-    X_tr, X_te, y_tr, y_te, p_tr, p_te = train_test_split(
-        X, y, protected, test_size=0.25, random_state=42, stratify=y
+    X_train, X_test, y_train, y_test, prot_train, prot_test = train_test_split(
+        X, y, protected, test_size=0.25, random_state=42, stratify=y,
     )
 
     baseline = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
-    baseline.fit(X_tr, y_tr)
+    baseline.fit(X_train, y_train)
 
     fair = ExponentiatedGradient(
         estimator=RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1),
         constraints=DemographicParity(),
         eps=0.02,
     )
-    fair.fit(X_tr, y_tr, sensitive_features=p_tr['gender'])
+    fair.fit(X_train, y_train, sensitive_features=prot_train['gender'])
 
     return {
-        'baseline': baseline, 'fair': fair,
-        'feature_columns': list(X_tr.columns),
-        'X_test': X_te, 'y_test': y_te, 'prot_test': p_te,
-        'df': df,
+        'baseline': baseline,
+        'fair': fair,
+        'feature_columns': list(X_train.columns),
+        'X_test': X_test, 'y_test': y_test, 'prot_test': prot_test,
     }
 
 
-with st.spinner("Loading models (30-90 seconds on first load, cached after)..."):
+with st.spinner("Preparing models (first load may take 60-90 seconds)..."):
     art = train_models()
 
 baseline_model = art['baseline']
@@ -145,17 +171,20 @@ fair_model = art['fair']
 feature_columns = art['feature_columns']
 
 
-# ============================================================
-# HELPER: build feature vector from user form
-# ============================================================
-def build_input_row(age, annual_income, credit_score, num_existing_loans,
-                    previous_defaults, loan_amount, loan_term_months,
-                    education, employment_type, home_ownership):
+# ---------------------------------------------------------------------------
+# Feature vector construction from user form
+# ---------------------------------------------------------------------------
+def build_input_row(
+    age, annual_income, credit_score, num_existing_loans,
+    previous_defaults, loan_amount, loan_term_months,
+    education, employment_type, home_ownership,
+):
+    """Convert form inputs into a one-hot encoded row aligned with training features."""
     monthly_income = annual_income / 12
     monthly_debt = num_existing_loans * 300 + loan_amount / loan_term_months
     dti = min(monthly_debt / monthly_income, 2.0)
 
-    d = {
+    values = {
         'age': age,
         'annual_income': annual_income,
         'credit_score': credit_score,
@@ -165,48 +194,48 @@ def build_input_row(age, annual_income, credit_score, num_existing_loans,
         'loan_term_months': loan_term_months,
         'debt_to_income_ratio': round(dti, 3),
     }
-    for edu in ['HighSchool', 'Masters', 'PhD']:      # 'Bachelors' dropped
-        d[f'education_{edu}'] = int(education == edu)
-    for emp in ['SelfEmployed', 'Unemployed']:         # 'Salaried' dropped
-        d[f'employment_type_{emp}'] = int(employment_type == emp)
-    for home in ['Own', 'Rent']:                       # 'Mortgage' dropped
-        d[f'home_ownership_{home}'] = int(home_ownership == home)
+    for edu in ['HighSchool', 'Masters', 'PhD']:
+        values[f'education_{edu}'] = int(education == edu)
+    for emp in ['SelfEmployed', 'Unemployed']:
+        values[f'employment_type_{emp}'] = int(employment_type == emp)
+    for home in ['Own', 'Rent']:
+        values[f'home_ownership_{home}'] = int(home_ownership == home)
 
-    row = pd.DataFrame([d]).reindex(columns=feature_columns, fill_value=0)
+    row = pd.DataFrame([values]).reindex(columns=feature_columns, fill_value=0)
     return row, dti
 
 
-# ============================================================
+# ---------------------------------------------------------------------------
 # UI
-# ============================================================
-st.title("Loan Approval — Fairness Audit Demo")
+# ---------------------------------------------------------------------------
+st.title("Loan Approval - Fairness Audit and Mitigation")
 st.markdown(
-    "A loan approval classifier with **demographic bias detection + mitigation** using "
-    "Fairlearn. See how a naive ML model discriminates, and how targeted mitigation "
-    "fixes it — without ever using gender/race as a feature."
+    "An interactive demonstration of demographic bias in loan approval models "
+    "and its mitigation using Fairlearn. The baseline model is trained without "
+    "gender or race features; the fair model applies a Demographic Parity "
+    "constraint via constrained optimisation."
 )
 
 with st.sidebar:
     st.title("About")
-    st.markdown("""
-Built on **synthetic data** with intentional bias by gender and race.
-
-**Comparison:**
-- Baseline Random Forest (inherits bias)
-- Fairlearn-mitigated model (bias reduced)
-
-**Tech:** scikit-learn · Fairlearn · Streamlit · Hugging Face Spaces
-
-[Source code on GitHub](https://github.com/Sushumna09/loan-approval-fairness)
-""")
+    st.markdown(
+        "**Task.** Binary classification: predict whether a loan application "
+        "will be approved.\n\n"
+        "**Data.** 10,000 synthetic applications with realistic feature "
+        "distributions and an intentionally biased approval label pattern.\n\n"
+        "**Models.**\n"
+        "- Baseline: Random Forest (scikit-learn)\n"
+        "- Fair: Random Forest wrapped in Fairlearn's `ExponentiatedGradient` "
+        "with a `DemographicParity` constraint (eps = 0.02)\n\n"
+        "[Source code](https://github.com/Sushumna09/loan-approval-fairness)"
+    )
 
 tab_predict, tab_audit, tab_how = st.tabs(
-    ["Predict", "Fairness Audit", "How It Works"]
+    ["Predict", "Fairness Audit", "Methodology"]
 )
 
-# ---- TAB 1: PREDICT ----
 with tab_predict:
-    st.header("Enter Applicant Details")
+    st.header("Applicant Details")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -231,111 +260,135 @@ with tab_predict:
         row, dti = build_input_row(
             age, annual_income, credit_score, num_existing_loans,
             previous_defaults, loan_amount, loan_term_months,
-            education, employment_type, home_ownership
+            education, employment_type, home_ownership,
         )
-        b_pred = baseline_model.predict(row)[0]
-        b_proba = baseline_model.predict_proba(row)[0, 1]
-        f_pred = fair_model.predict(row)[0]
+
+        baseline_prediction = baseline_model.predict(row)[0]
+        baseline_probability = baseline_model.predict_proba(row)[0, 1]
+        fair_prediction = fair_model.predict(row)[0]
 
         st.markdown("---")
         st.caption(f"Debt-to-income ratio (derived): {dti:.2%}")
+
         cA, cB = st.columns(2)
         with cA:
             st.subheader("Baseline Model")
-            st.caption("Trained without gender/race, but inherits bias via proxies")
-            if b_pred == 1:
-                st.success(f"APPROVED   ({b_proba:.1%} probability)")
+            if baseline_prediction == 1:
+                st.success(f"APPROVED  ({baseline_probability:.1%} probability)")
             else:
-                st.error(f"REJECTED   ({b_proba:.1%} probability)")
+                st.error(f"REJECTED  ({baseline_probability:.1%} probability)")
+
         with cB:
-            st.subheader("Fair Model (Fairlearn)")
-            st.caption("Same data, with Demographic Parity constraint")
-            if f_pred == 1:
+            st.subheader("Fair Model")
+            if fair_prediction == 1:
                 st.success("APPROVED")
             else:
                 st.error("REJECTED")
 
-        if b_pred != f_pred:
+        if baseline_prediction != fair_prediction:
             st.warning(
-                "**The two models disagree on this applicant.** "
-                "This is where fairness mitigation actively changes an outcome."
+                "The two models disagree on this applicant, indicating that the "
+                "fairness constraint has changed the outcome for this profile."
             )
 
-# ---- TAB 2: AUDIT ----
 with tab_audit:
-    st.header("Before vs After Bias Mitigation")
-    st.markdown("Measured on the held-out test set.")
+    st.header("Fairness Comparison on Held-Out Test Set")
 
     X_test = art['X_test']
     y_test = art['y_test']
     prot_test = art['prot_test']
 
-    b_pred_all = baseline_model.predict(X_test)
-    f_pred_all = fair_model.predict(X_test)
+    baseline_pred_all = baseline_model.predict(X_test)
+    fair_pred_all = fair_model.predict(X_test)
 
-    def group_sel(y_pred, groups):
+    def selection_rate_by_group(y_pred, groups):
         return pd.Series(y_pred).groupby(groups.values).mean()
 
-    b_g = group_sel(b_pred_all, prot_test['gender'])
-    f_g = group_sel(f_pred_all, prot_test['gender'])
-    b_r = group_sel(b_pred_all, prot_test['race'])
-    f_r = group_sel(f_pred_all, prot_test['race'])
+    baseline_by_gender = selection_rate_by_group(baseline_pred_all, prot_test['gender'])
+    fair_by_gender     = selection_rate_by_group(fair_pred_all, prot_test['gender'])
+    baseline_by_race   = selection_rate_by_group(baseline_pred_all, prot_test['race'])
+    fair_by_race       = selection_rate_by_group(fair_pred_all, prot_test['race'])
 
-    b_acc = accuracy_score(y_test, b_pred_all)
-    f_acc = accuracy_score(y_test, f_pred_all)
-    b_dp = b_g.max() - b_g.min()
-    f_dp = f_g.max() - f_g.min()
+    baseline_accuracy = accuracy_score(y_test, baseline_pred_all)
+    fair_accuracy = accuracy_score(y_test, fair_pred_all)
+    baseline_dp_gap = baseline_by_gender.max() - baseline_by_gender.min()
+    fair_dp_gap = fair_by_gender.max() - fair_by_gender.min()
 
     c1, c2 = st.columns(2)
     with c1:
-        st.metric("Baseline accuracy", f"{b_acc:.1%}")
-        st.metric("Baseline DP gap (gender)", f"{b_dp:.1%}")
+        st.metric("Baseline accuracy", f"{baseline_accuracy:.1%}")
+        st.metric("Baseline DP gap (gender)", f"{baseline_dp_gap:.1%}")
     with c2:
-        st.metric("Fair accuracy", f"{f_acc:.1%}",
-                  delta=f"{(f_acc - b_acc)*100:+.1f}pp")
-        st.metric("Fair DP gap (gender)", f"{f_dp:.1%}",
-                  delta=f"{(f_dp - b_dp)*100:+.1f}pp",
-                  delta_color="inverse")
+        st.metric(
+            "Fair accuracy", f"{fair_accuracy:.1%}",
+            delta=f"{(fair_accuracy - baseline_accuracy) * 100:+.1f} pp",
+        )
+        st.metric(
+            "Fair DP gap (gender)", f"{fair_dp_gap:.1%}",
+            delta=f"{(fair_dp_gap - baseline_dp_gap) * 100:+.1f} pp",
+            delta_color="inverse",
+        )
 
-    st.markdown("### Approval Rates by Gender")
-    st.bar_chart(pd.DataFrame({'Baseline': b_g, 'Fair': f_g}))
+    st.markdown("### Approval Rate by Gender")
+    st.bar_chart(pd.DataFrame({'Baseline': baseline_by_gender, 'Fair': fair_by_gender}))
 
-    st.markdown("### Approval Rates by Race")
-    st.bar_chart(pd.DataFrame({'Baseline': b_r, 'Fair': f_r}))
+    st.markdown("### Approval Rate by Race")
+    st.bar_chart(pd.DataFrame({'Baseline': baseline_by_race, 'Fair': fair_by_race}))
 
     st.info(
-        "**Takeaway:** the baseline model was trained WITHOUT gender/race, "
-        "yet its predicted approval rates differ by demographic. "
-        "Correlated features (income ↔ gender, credit ↔ race) act as proxies. "
-        "Fairlearn's Exponentiated Gradient with a Demographic Parity constraint "
-        "shrinks the gaps."
+        "The baseline model was trained without gender or race as features, yet its "
+        "predicted approval rates differ across demographic groups. This is because "
+        "features such as income and credit score correlate with those protected "
+        "attributes and act as proxy variables. The fairness-constrained model "
+        "reduces the demographic parity gap, at a measurable cost in raw accuracy "
+        "against the (biased) historical labels."
     )
 
-# ---- TAB 3: HOW IT WORKS ----
 with tab_how:
-    st.header("Project Overview")
-    st.markdown("""
-### The Problem
-Loan approval models trained on historical data often inherit bias against women
-and minorities — even when protected attributes (gender, race) are dropped from
-the training features. This is because other features (income, credit score,
-education) *correlate* with those attributes.
+    st.header("Methodology")
+    st.markdown(
+        """
+### Data
+A synthetic dataset of 10,000 loan applications is generated on startup with
+a fixed random seed. Features include demographic attributes (age, gender,
+race, education, employment), financial attributes (annual income, credit
+score, existing debt, previous defaults), and loan characteristics
+(amount, term, housing status).
 
-### The Approach
-1. **Generate synthetic data** with intentional demographic bias
-2. **Train a baseline Random Forest** without gender/race features
-3. **Measure bias**: demographic parity + equal opportunity across groups
-4. **Mitigate**: apply Fairlearn's Exponentiated Gradient (Agarwal et al., 2018)
-5. **Explain**: use SHAP to show which features drive predictions
+The historical approval label is generated in two stages:
+1. A true underlying default risk based only on real financial signals
+   (credit score, debt-to-income ratio, previous defaults, income).
+2. A biased approval decision that combines that risk with a demographic
+   penalty against female, Black, and Hispanic applicants, simulating
+   historically biased lending practice.
 
-### Tech Stack
-scikit-learn · Fairlearn · SHAP · Streamlit · Hugging Face Spaces
+### Baseline Model
+`RandomForestClassifier` (200 trees, `random_state=42`) trained on all
+features **except** gender and race. This tests the "fairness through
+unawareness" hypothesis.
 
-### Source Code
-https://github.com/Sushumna09/loan-approval-fairness
+### Fair Model
+Fairlearn's `ExponentiatedGradient` reduction, wrapping a
+`RandomForestClassifier` (100 trees), constrained by `DemographicParity`
+with `eps=0.02`. The reduction reformulates the fair-classification
+problem as a sequence of cost-sensitive classification subproblems and
+returns a randomised classifier that provably satisfies the constraint
+up to `eps`.
 
-### Why Synthetic Data?
-So we know exactly where the bias lives and can measure whether our fairness
-methods correctly detect and remove it. Same approach as IBM AIF360 and other
-fairness research benchmarks.
-""")
+### Metrics
+- **Accuracy**: standard fraction of correct predictions against test-set
+  labels (noting that those labels are themselves biased).
+- **Demographic Parity difference**: difference between the highest and
+  lowest group-level selection rates. A DP difference of 0 means every
+  group is approved at the same rate.
+- **Equal Opportunity difference**: difference between the highest and
+  lowest group-level true-positive rates.
+
+### References
+- Agarwal, A., et al. *A Reductions Approach to Fair Classification.*
+  ICML 2018.
+- Hardt, M., Price, E., Srebro, N. *Equality of Opportunity in Supervised
+  Learning.* NIPS 2016.
+- Fairlearn documentation: https://fairlearn.org
+"""
+    )
